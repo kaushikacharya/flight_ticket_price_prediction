@@ -6,17 +6,54 @@ from math import sqrt
 import numpy as np
 import os
 import pandas as pd
+import re
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_log_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
 
 
+def compute_duration(duration_str, time_format='hour'):
+    """Compute duration in minutes from the duration string
+
+        Parameters
+        ----------
+        duration_str : str
+                e.g. 2h 20m  It can also contain only hour or minutes.
+        time_format : str
+                Either 'minute' or 'hour'
+    """
+    assert time_format in ['hour', 'minute'], "Expected time_format should be either 'hour' or 'minute'"
+    duration = 0
+    hour_arr = re.findall(r'\d+h', duration_str)
+    if len(hour_arr) > 0:
+        if time_format == "minute":
+            duration += 60*int(hour_arr[0][:-1])
+        elif time_format == "hour":
+            duration += int(hour_arr[0][:-1])
+        else:
+            assert False, "Unexpected time_format: {0}".format(time_format)
+
+    minute_arr = re.findall(r'\d+m', duration_str)
+    if len(minute_arr) > 0:
+        if time_format == "minute":
+            duration += int(minute_arr[0][:-1])
+        elif time_format == "hour":
+            duration += int(minute_arr[0][:-1])*1.0/60
+        else:
+            assert False, "Unexpected time_format: {0}".format(time_format)
+
+    return duration
+
+
 class FlightTicketPrice:
-    def __init__(self, data_folder):
+    def __init__(self, data_folder, train_size, random_state=100):
         self.data_folder = data_folder
         self.train_df = None
         self.test_df = None
+
+        self.train_size = train_size
+        self.random_state = random_state
 
         self.min_date_of_journey = None
         self.one_hot_encoder = None
@@ -76,6 +113,12 @@ class FlightTicketPrice:
         df['n_stops'] = df.apply(lambda row: (
         0 if len(row['Total_Stops'].split()) == 1 else int(row['Total_Stops'].split()[0])) if isinstance(
             row['Total_Stops'], unicode) else np.nan, axis=1)
+
+        df['Duration_numeric'] = df.apply(lambda row: compute_duration(duration_str=row['Duration']), axis=1)
+
+        # Changes based on observation of data
+        df.loc[(df['Airline'] == 'Jet Airways Business') & (df['Additional_Info'] == 'No info'), 'Additional_Info'] = 'Business class'
+        df.loc[(df['Airline'] == 'Jet Airways Business'), 'Airline'] = 'Jet Airways'
 
         return df
 
@@ -366,17 +409,17 @@ class FlightTicketPrice:
         self.train_df['Journey_day_from_min'] = [x.days for x in (self.train_df['Date_of_Journey'] - self.min_date_of_journey)]
         self.test_df['Journey_day_from_min'] = [x.days for x in (self.test_df['Date_of_Journey'] - self.min_date_of_journey)]
 
-        self.train_df['hour'] = [x.seconds/60 for x in (self.train_df['Departure_datetime'] - self.train_df['Date_of_Journey'])]
-        self.test_df['hour'] = [x.seconds/60 for x in (self.test_df['Departure_datetime'] - self.test_df['Date_of_Journey'])]
+        self.train_df['Departure_numeric'] = [x.seconds/60 for x in (self.train_df['Departure_datetime'] - self.train_df['Date_of_Journey'])]
+        self.test_df['Departure_numeric'] = [x.seconds/60 for x in (self.test_df['Departure_datetime'] - self.test_df['Date_of_Journey'])]
 
-        train_index_arr, validation_index_arr = train_test_split(self.train_df.index, train_size=0.99, random_state=100)
+        train_index_arr, validation_index_arr = train_test_split(self.train_df.index, train_size=self.train_size, random_state=self.random_state)
 
         self.train_index_arr = train_index_arr
         self.validation_index_arr = validation_index_arr
 
         # https://scikit-learn.org/stable/modules/preprocessing.html#preprocessing-categorical-features
         self.one_hot_encoder = OneHotEncoder(handle_unknown='ignore')
-        columns_one_hot = ['Airline', 'Source_code', 'Destination_code', 'Route', 'Weekday']
+        columns_one_hot = ['Airline', 'Source_code', 'Destination_code', 'Route', 'Weekday', 'Additional_Info']
         self.one_hot_encoder.fit(self.train_df.loc[train_index_arr, columns_one_hot].values)
         # print(enc.categories_)
 
@@ -384,7 +427,7 @@ class FlightTicketPrice:
         one_hot_validation_matrix = self.one_hot_encoder.transform(self.train_df.loc[validation_index_arr, columns_one_hot].values).toarray().astype(int)
         one_hot_test_matrix = self.one_hot_encoder.transform(self.test_df[columns_one_hot].values).toarray().astype(int)
 
-        columns_numeric = ['n_stops', 'Journey_day_from_min', 'hour']
+        columns_numeric = ['n_stops', 'Journey_day_from_min', 'Departure_numeric', 'Duration_numeric']
 
         numeric_train_matrix = self.train_df.loc[train_index_arr, columns_numeric].values
         self.feature_train_matrix = np.hstack((one_hot_train_matrix, numeric_train_matrix))
@@ -395,13 +438,34 @@ class FlightTicketPrice:
         numeric_test_matrix = self.test_df[columns_numeric].values
         self.feature_test_matrix = np.hstack((one_hot_test_matrix, numeric_test_matrix))
 
-    def train_random_forest(self):
+    def train_random_forest(self, write_output=False):
         self.clf_random_forest_regression = RandomForestRegressor(n_estimators=100)
         self.clf_random_forest_regression.fit(X=self.feature_train_matrix, y=self.train_df.loc[self.train_index_arr, 'Price'])
 
         # Now predict on validation set
         y_predicted_arr = self.clf_random_forest_regression.predict(X=self.feature_validation_matrix)
         y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
+
+        if write_output:
+            output_folder = "../output"
+
+            if not os.path.exists(output_folder):
+                os.makedirs(output_folder)
+
+            train_subset_df = self.train_df.loc[self.train_index_arr, ]
+            # sort in order of Departure datetime for analysis convenience
+            train_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
+            with open(os.path.join(output_folder, "train_subset.csv"), "w") as fd:
+                train_subset_df.to_csv(fd, index=False, encoding="utf-8")
+
+            validation_subset_df = self.train_df.loc[self.validation_index_arr, ]
+            validation_subset_df['Predicted_price'] = y_predicted_arr
+            validation_subset_df['Diff_price'] = y_true_arr - y_predicted_arr
+            # sort in order of Departure datetime for analysis convenience
+            validation_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
+
+            with open(os.path.join(output_folder, "validation_subset.csv"), "w") as fd:
+                validation_subset_df.to_csv(fd, index=False, encoding="utf-8")
 
         try:
             rmse_train = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
@@ -411,7 +475,7 @@ class FlightTicketPrice:
             y_predicted_arr = [y_predicted_arr[i] for i in range(len(y_predicted_arr)) if not np.isnan(y_predicted_arr[i])]
             rmse_train = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
 
-        print("\nRMSE (train): {0} :: n_samples: {1}".format(rmse_train, len(y_true_arr)))
+        print("\nRMSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmse_train, len(self.train_index_arr), len(self.validation_index_arr)))
 
     def predict_random_forest(self):
         y_predicted_arr = self.clf_random_forest_regression.predict(X=self.feature_test_matrix)
@@ -429,7 +493,8 @@ class FlightTicketPrice:
         excel_writer.close()
 
 if __name__ == "__main__":
-    flight_ticket_price_obj = FlightTicketPrice(data_folder="../data/Flight_Ticket_Participant_Datasets-20190305T100527Z-001/Flight_Ticket_Participant_Datasets")
+    folder_data = "../data/Flight_Ticket_Participant_Datasets-20190305T100527Z-001/Flight_Ticket_Participant_Datasets"
+    flight_ticket_price_obj = FlightTicketPrice(data_folder=folder_data, train_size=0.99, random_state=100)
     flight_ticket_price_obj.load_train_data(train_data_file="Data_Train.xlsx", verbose=True)
     flight_ticket_price_obj.load_test_data(test_data_file_name="Test_set.xlsx")
 
@@ -448,7 +513,7 @@ if __name__ == "__main__":
     # flight_ticket_price_obj.analyse_test_data()
 
     flight_ticket_price_obj.create_feature_matrix()
-    flight_ticket_price_obj.train_random_forest()
+    flight_ticket_price_obj.train_random_forest(write_output=True)
 
     flight_ticket_price_obj.predict_random_forest()
 
