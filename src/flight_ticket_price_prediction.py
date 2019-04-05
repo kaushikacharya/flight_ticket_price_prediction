@@ -7,7 +7,7 @@ import numpy as np
 import os
 import pandas as pd
 import re
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_log_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
@@ -66,6 +66,7 @@ class FlightTicketPrice:
         self.validation_index_arr = None
 
         self.clf_random_forest_regression = None
+        self.clf_gradient_boosting_regression = None
 
         pd.set_option('display.width', 5000)
         pd.set_option('display.max_columns', 60)
@@ -117,6 +118,7 @@ class FlightTicketPrice:
         df['Duration_numeric'] = df.apply(lambda row: compute_duration(duration_str=row['Duration']), axis=1)
 
         # Changes based on observation of data
+        # https://stackoverflow.com/questions/37675869/how-can-i-conditionally-update-multiple-columns-in-a-panda-dataframe
         df.loc[(df['Airline'] == 'Jet Airways Business') & (df['Additional_Info'] == 'No info'), 'Additional_Info'] = 'Business class'
         df.loc[(df['Airline'] == 'Jet Airways Business'), 'Airline'] = 'Jet Airways'
 
@@ -412,6 +414,9 @@ class FlightTicketPrice:
         self.train_df['Departure_numeric'] = [x.seconds/60 for x in (self.train_df['Departure_datetime'] - self.train_df['Date_of_Journey'])]
         self.test_df['Departure_numeric'] = [x.seconds/60 for x in (self.test_df['Departure_datetime'] - self.test_df['Date_of_Journey'])]
 
+        self.train_df['Arrival_numeric'] = [(pd.to_datetime(x.split()[0], format='%H:%M') - pd.to_datetime('00:00', format='%H:%M')).seconds/60 for x in self.train_df['Arrival_Time']]
+        self.test_df['Arrival_numeric'] = [(pd.to_datetime(x.split()[0], format='%H:%M') - pd.to_datetime('00:00', format='%H:%M')).seconds / 60 for x in self.test_df['Arrival_Time']]
+
         train_index_arr, validation_index_arr = train_test_split(self.train_df.index, train_size=self.train_size, random_state=self.random_state)
 
         self.train_index_arr = train_index_arr
@@ -419,7 +424,7 @@ class FlightTicketPrice:
 
         # https://scikit-learn.org/stable/modules/preprocessing.html#preprocessing-categorical-features
         self.one_hot_encoder = OneHotEncoder(handle_unknown='ignore')
-        columns_one_hot = ['Airline', 'Source_code', 'Destination_code', 'Route', 'Weekday', 'Additional_Info']
+        columns_one_hot = ['Airline', 'Source_code', 'Destination_code', 'Route', 'Weekday', 'Additional_Info', 'Total_Stops']
         self.one_hot_encoder.fit(self.train_df.loc[train_index_arr, columns_one_hot].values)
         # print(enc.categories_)
 
@@ -427,7 +432,7 @@ class FlightTicketPrice:
         one_hot_validation_matrix = self.one_hot_encoder.transform(self.train_df.loc[validation_index_arr, columns_one_hot].values).toarray().astype(int)
         one_hot_test_matrix = self.one_hot_encoder.transform(self.test_df[columns_one_hot].values).toarray().astype(int)
 
-        columns_numeric = ['n_stops', 'Journey_day_from_min', 'Departure_numeric', 'Duration_numeric']
+        columns_numeric = ['Journey_day_from_min', 'Departure_numeric', 'Arrival_numeric']  # 'Duration_numeric', 'n_stops'
 
         numeric_train_matrix = self.train_df.loc[train_index_arr, columns_numeric].values
         self.feature_train_matrix = np.hstack((one_hot_train_matrix, numeric_train_matrix))
@@ -439,7 +444,7 @@ class FlightTicketPrice:
         self.feature_test_matrix = np.hstack((one_hot_test_matrix, numeric_test_matrix))
 
     def train_random_forest(self, write_output=False):
-        self.clf_random_forest_regression = RandomForestRegressor(n_estimators=100)
+        self.clf_random_forest_regression = RandomForestRegressor(n_estimators=200, criterion="friedman_mse")  # friedman_mse
         self.clf_random_forest_regression.fit(X=self.feature_train_matrix, y=self.train_df.loc[self.train_index_arr, 'Price'])
 
         # Now predict on validation set
@@ -447,39 +452,74 @@ class FlightTicketPrice:
         y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
 
         if write_output:
-            output_folder = "../output"
-
-            if not os.path.exists(output_folder):
-                os.makedirs(output_folder)
-
-            train_subset_df = self.train_df.loc[self.train_index_arr, ]
-            # sort in order of Departure datetime for analysis convenience
-            train_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
-            with open(os.path.join(output_folder, "train_subset.csv"), "w") as fd:
-                train_subset_df.to_csv(fd, index=False, encoding="utf-8")
-
-            validation_subset_df = self.train_df.loc[self.validation_index_arr, ]
-            validation_subset_df['Predicted_price'] = y_predicted_arr
-            validation_subset_df['Diff_price'] = y_true_arr - y_predicted_arr
-            # sort in order of Departure datetime for analysis convenience
-            validation_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
-
-            with open(os.path.join(output_folder, "validation_subset.csv"), "w") as fd:
-                validation_subset_df.to_csv(fd, index=False, encoding="utf-8")
+            self.write_validation_prediction(y_predicted_arr=y_predicted_arr)
 
         try:
-            rmse_train = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
         except Exception, err:
             print("Nan count: {0}".format(len(np.where(np.isnan(y_predicted_arr))[0])))
             y_true_arr = [y_true_arr[i] for i in range(len(y_true_arr)) if not np.isnan(y_predicted_arr[i])]
             y_predicted_arr = [y_predicted_arr[i] for i in range(len(y_predicted_arr)) if not np.isnan(y_predicted_arr[i])]
-            rmse_train = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
 
-        print("\nRMSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmse_train, len(self.train_index_arr), len(self.validation_index_arr)))
+        print("\nRMLSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmsle, len(self.train_index_arr), len(self.validation_index_arr)))
+
+    def train_gradient_boosting(self, write_output=False):
+        # https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.GradientBoostingRegressor.html#sklearn.ensemble.GradientBoostingRegressor
+        self.clf_gradient_boosting_regression = GradientBoostingRegressor(n_estimators=200, criterion="friedman_mse")
+        self.clf_gradient_boosting_regression.fit(X=self.feature_train_matrix, y=self.train_df.loc[self.train_index_arr, 'Price'])
+
+        # Now predict on validation set
+        y_predicted_arr = self.clf_gradient_boosting_regression.predict(X=self.feature_validation_matrix)
+        y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
+
+        if write_output:
+            self.write_validation_prediction(y_predicted_arr=y_predicted_arr)
+
+        try:
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+        except Exception, err:
+            print("Nan count: {0}".format(len(np.where(np.isnan(y_predicted_arr))[0])))
+            y_true_arr = [y_true_arr[i] for i in range(len(y_true_arr)) if not np.isnan(y_predicted_arr[i])]
+            y_predicted_arr = [y_predicted_arr[i] for i in range(len(y_predicted_arr)) if
+                               not np.isnan(y_predicted_arr[i])]
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+
+        print("\nRMLSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmsle, len(
+            self.train_index_arr), len(self.validation_index_arr)))
 
     def predict_random_forest(self):
         y_predicted_arr = self.clf_random_forest_regression.predict(X=self.feature_test_matrix)
+        self.write_test_prediction(y_predicted_arr=y_predicted_arr)
 
+    def write_validation_prediction(self, y_predicted_arr):
+        y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
+
+        output_folder = "../output"
+
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+
+        # Dump entire train+validation sets
+        with open(os.path.join(output_folder, "train_full.csv"), "w") as fd:
+            self.train_df.to_csv(fd, index=False, encoding="utf-8")
+
+        train_subset_df = self.train_df.loc[self.train_index_arr,]
+        # sort in order of Departure datetime for analysis convenience
+        train_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
+        with open(os.path.join(output_folder, "train_subset.csv"), "w") as fd:
+            train_subset_df.to_csv(fd, index=False, encoding="utf-8")
+
+        validation_subset_df = self.train_df.loc[self.validation_index_arr,]
+        validation_subset_df['Predicted_price'] = y_predicted_arr
+        validation_subset_df['Diff_price'] = y_true_arr - y_predicted_arr
+        # sort in order of Departure datetime for analysis convenience
+        validation_subset_df.sort_values(by=u'Departure_datetime', inplace=True)
+
+        with open(os.path.join(output_folder, "validation_subset.csv"), "w") as fd:
+            validation_subset_df.to_csv(fd, index=False, encoding="utf-8")
+
+    def write_test_prediction(self, y_predicted_arr):
         result_folder = "../result"
         if not os.path.exists(result_folder):
             os.makedirs(result_folder)
@@ -494,7 +534,7 @@ class FlightTicketPrice:
 
 if __name__ == "__main__":
     folder_data = "../data/Flight_Ticket_Participant_Datasets-20190305T100527Z-001/Flight_Ticket_Participant_Datasets"
-    flight_ticket_price_obj = FlightTicketPrice(data_folder=folder_data, train_size=0.99, random_state=100)
+    flight_ticket_price_obj = FlightTicketPrice(data_folder=folder_data, train_size=0.7, random_state=100)
     flight_ticket_price_obj.load_train_data(train_data_file="Data_Train.xlsx", verbose=True)
     flight_ticket_price_obj.load_test_data(test_data_file_name="Test_set.xlsx")
 
@@ -513,9 +553,11 @@ if __name__ == "__main__":
     # flight_ticket_price_obj.analyse_test_data()
 
     flight_ticket_price_obj.create_feature_matrix()
-    flight_ticket_price_obj.train_random_forest(write_output=True)
 
+    flight_ticket_price_obj.train_random_forest(write_output=True)
     flight_ticket_price_obj.predict_random_forest()
+
+    # flight_ticket_price_obj.train_gradient_boosting(write_output=False)
 
 """
 Problem Statement:
@@ -543,6 +585,8 @@ Approaches:
         - Here they have applied for Doctor fees prediction
 
 TODO
+    - Dump combined train_subset, validation_subset [DONE]
+    - Holiday as features
     - 'Additional_Info' is missing info for several cases.
         - Need to identify the airlines which has multiple rows with everything same except the price.
         - Would have to tag it programmatically.
