@@ -9,8 +9,10 @@ import pandas as pd
 import re
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_log_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.preprocessing import OneHotEncoder
+from time import time
+from xgboost import XGBRegressor
 
 
 def compute_duration(duration_str, time_format='hour'):
@@ -67,6 +69,7 @@ class FlightTicketPrice:
 
         self.clf_random_forest_regression = None
         self.clf_gradient_boosting_regression = None
+        self.clf_xgboost_regression = None
 
         pd.set_option('display.width', 5000)
         pd.set_option('display.max_columns', 60)
@@ -99,6 +102,7 @@ class FlightTicketPrice:
         df['Date_of_Journey'] = pd.to_datetime(df['Date_of_Journey'], format='%d/%m/%Y')
         # https://stackoverflow.com/questions/39207640/python-pandas-how-do-i-convert-from-datetime64ns-to-datetime
         df['Weekday'] = df['Departure_datetime'].dt.strftime('%a')
+        df['WeekNumber'] = df['Departure_datetime'].dt.strftime('%U')
 
         # Create source, destination airport code from the route.
         #   This will ensure that Delhi and New Delhi are treated same as their airport codes are same.
@@ -432,7 +436,7 @@ class FlightTicketPrice:
         one_hot_validation_matrix = self.one_hot_encoder.transform(self.train_df.loc[validation_index_arr, columns_one_hot].values).toarray().astype(int)
         one_hot_test_matrix = self.one_hot_encoder.transform(self.test_df[columns_one_hot].values).toarray().astype(int)
 
-        columns_numeric = ['Journey_day_from_min', 'Departure_numeric', 'Arrival_numeric']  # 'Duration_numeric', 'n_stops'
+        columns_numeric = ['Journey_day_from_min', 'WeekNumber', 'Departure_numeric', 'Arrival_numeric']  # 'Duration_numeric', 'n_stops'
 
         numeric_train_matrix = self.train_df.loc[train_index_arr, columns_numeric].values
         self.feature_train_matrix = np.hstack((one_hot_train_matrix, numeric_train_matrix))
@@ -488,9 +492,64 @@ class FlightTicketPrice:
         print("\nRMLSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmsle, len(
             self.train_index_arr), len(self.validation_index_arr)))
 
+    # https://machinelearningmastery.com/develop-first-xgboost-model-python-scikit-learn/
+    def train_xgboost(self, write_output=False):
+        self.clf_xgboost_regression = XGBRegressor(n_estimators=200)
+        self.clf_xgboost_regression.fit(X=self.feature_train_matrix, y=self.train_df.loc[self.train_index_arr, 'Price'])
+
+        # Now predict on validation set
+        y_predicted_arr = self.clf_xgboost_regression.predict(data=self.feature_validation_matrix)
+        y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
+
+        if write_output:
+            self.write_validation_prediction(y_predicted_arr=y_predicted_arr)
+
+        try:
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+        except Exception, err:
+            print("Nan count: {0}".format(len(np.where(np.isnan(y_predicted_arr))[0])))
+            y_true_arr = [y_true_arr[i] for i in range(len(y_true_arr)) if not np.isnan(y_predicted_arr[i])]
+            y_predicted_arr = [y_predicted_arr[i] for i in range(len(y_predicted_arr)) if
+                               not np.isnan(y_predicted_arr[i])]
+            rmsle = sqrt(mean_squared_log_error(y_true=y_true_arr, y_pred=y_predicted_arr))
+
+        print("\nRMLSE (train): {0} :: n_samples(train): {1} :: n_samples(validation): {2}".format(rmsle, len(
+            self.train_index_arr), len(self.validation_index_arr)))
+
     def predict_random_forest(self):
         y_predicted_arr = self.clf_random_forest_regression.predict(X=self.feature_test_matrix)
         self.write_test_prediction(y_predicted_arr=y_predicted_arr)
+
+    def hyperparameter_grid_search_random_forest(self):
+        # https://scikit-learn.org/stable/auto_examples/model_selection/plot_randomized_search.html#sphx-glr-auto-examples-model-selection-plot-randomized-search-py
+        # Utility function to report best scores
+        def report(results, n_top=3):
+            for i in range(1, n_top + 1):
+                candidates = np.flatnonzero(results['rank_test_score'] == i)
+                for candidate in candidates:
+                    print("Model with rank: {0}".format(i))
+                    print("Mean validation score: {0:.3f} (std: {1:.3f})".format(
+                        results['mean_test_score'][candidate],
+                        results['std_test_score'][candidate]))
+                    print("Parameters: {0}\n".format(results['params'][candidate]))
+
+        param_grid = {'criterion': ['mse', 'friedman_mse'],
+                      'min_samples_split': [2, 5, 10]}
+
+        clf = RandomForestRegressor(n_estimators=200, n_jobs=-1)
+
+        feature_matrix = np.vstack((self.feature_train_matrix, self.feature_validation_matrix))
+        index_arr = list(self.train_index_arr)
+        index_arr.extend(self.validation_index_arr)
+        y_true_arr = self.train_df.loc[index_arr, 'Price']
+
+        grid_search = GridSearchCV(clf, param_grid=param_grid, cv=5)
+        start = time()
+        grid_search.fit(X=feature_matrix, y=y_true_arr)
+
+        print("GridSearchCV took %.2f seconds for %d candidate parameter settings."
+              % (time() - start, len(grid_search.cv_results_['params'])))
+        report(grid_search.cv_results_)
 
     def write_validation_prediction(self, y_predicted_arr):
         y_true_arr = self.train_df.loc[self.validation_index_arr, 'Price']
@@ -554,10 +613,14 @@ if __name__ == "__main__":
 
     flight_ticket_price_obj.create_feature_matrix()
 
-    flight_ticket_price_obj.train_random_forest(write_output=True)
+    flight_ticket_price_obj.hyperparameter_grid_search_random_forest()
+
+    flight_ticket_price_obj.train_random_forest(write_output=False)
     flight_ticket_price_obj.predict_random_forest()
 
-    # flight_ticket_price_obj.train_gradient_boosting(write_output=False)
+    flight_ticket_price_obj.train_gradient_boosting(write_output=False)
+
+    flight_ticket_price_obj.train_xgboost(write_output=False)
 
 """
 Problem Statement:
